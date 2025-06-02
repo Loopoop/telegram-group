@@ -2,7 +2,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
 // Replace with your actual tokens
-const token = '8110615479:AAG416BSa60D8thLFcQvwCwG-VNMQu2ktN4';
+const token = null;
 const weatherApiKey = 'YOUR_OPENWEATHERMAP_API_KEY';
 
 const bot = new TelegramBot(token, { polling: true });
