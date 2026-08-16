@@ -812,6 +812,10 @@ async function searchWikipedia(input) {
 
   const searchResponse = await axios.get(searchUrl, {
     timeout: onlineSearchConfig.timeoutMs,
+    headers: {
+      "User-Agent": "MyNodeApp/1.0 (kamaujoe708@gmail.com)",
+    },
+
     params: {
       action: "query",
       list: "search",
@@ -827,7 +831,12 @@ async function searchWikipedia(input) {
 
   const summaryResponse = await axios.get(
     `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(first.title)}`,
-    { timeout: onlineSearchConfig.timeoutMs },
+    {
+      headers: {
+        "User-Agent": "MyNodeApp/1.0 (kamaujoe708@gmail.com)",
+      },
+      timeout: onlineSearchConfig.timeoutMs,
+    },
   );
 
   const summary = summaryResponse.data;
@@ -855,7 +864,7 @@ async function searchWebInstantAnswer(input) {
   });
 
   const data = response.data;
-  console.log("DuckDuckGo response:", data);
+  //console.log("DuckDuckGo response:", data);
   const answer = data.AbstractText || data.Answer;
   if (!answer) return null;
 
@@ -870,7 +879,6 @@ async function searchWebInstantAnswer(input) {
 async function searchOnline(input) {
   try {
     const wikipedia = await searchWikipedia(input);
-    console.log("Wikipedia search result:", wikipedia);
     if (wikipedia) return wikipedia;
   } catch (error) {
     //console.log("Wikipedia search failed:", error.message);
