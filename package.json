@@ -2,6 +2,7 @@
   "name": "chat-joe",
   "version": "1.0.0",
   "main": "bot.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node bot.js"
   },
@@ -11,6 +12,7 @@
   "description": "telegram bot",
   "dependencies": {
     "axios": "^1.9.0",
+    "dotenv": "^17.4.2",
     "node-telegram-bot-api": "^1.2.0"
   }
 }
