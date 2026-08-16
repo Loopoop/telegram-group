@@ -16,19 +16,219 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, "👋 Hello! I am your Telegram bot!");
 });
 
+bot.onText(/\/rules/, (msg) => {
+  bot.sendMessage(msg.chat.id, formatGroupRules());
+});
+
 // Respond to any text message
-bot.on("message", (msg) => {
+bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
-  if (!text.startsWith("/")) {
-    let handle = handleUserInput(text);
-    console.log(handle);
-    bot.sendMessage(chatId, handle);
+  if (await moderateGroupMessage(msg)) return;
+
+  if (typeof text === "string" && !text.startsWith("/")) {
+    const handle = handleUserInput(chatId, text);
+    if (handle) {
+      bot.sendMessage(chatId, handle);
+    }
   }
 });
 
 let knowledge = require("./Aidata");
+const memoryFile = path.join(__dirname, "learned-memory.json");
+
+function loadLearnedMemory() {
+  try {
+    if (!fs.existsSync(memoryFile)) return {};
+    const data = JSON.parse(fs.readFileSync(memoryFile, "utf8"));
+    return data && typeof data === "object" && !Array.isArray(data) ? data : {};
+  } catch (error) {
+    console.error("Could not load learned memory:", error.message);
+    return {};
+  }
+}
+
+function saveLearnedMemory() {
+  fs.writeFileSync(memoryFile, `${JSON.stringify(memory, null, 2)}\n`);
+}
+
+let memory = loadLearnedMemory();
+const chatStates = new Map();
+const moderationStates = new Map();
+
+const groupRules = [
+  "No spam, repeated messages, or flooding.",
+  "No suspicious links, invite links, or unsolicited promotion.",
+  "No insults, hate speech, threats, or harassment.",
+  "No excessive caps or disruptive messages.",
+];
+
+const moderationConfig = {
+  maxWarnings: 2,
+  floodWindowMs: 10 * 1000,
+  maxMessagesInWindow: 5,
+  repeatWindowMs: 60 * 1000,
+  muteMinutes: 10,
+  bannedWords: [
+    "scam",
+    "free money",
+    "click here",
+    "join my channel",
+    "crypto pump",
+  ],
+};
+
+function formatGroupRules() {
+  return `Group rules:\n${groupRules.map((rule, index) => `${index + 1}. ${rule}`).join("\n")}`;
+}
+
+function isGroupChat(chat) {
+  return chat && (chat.type === "group" || chat.type === "supergroup");
+}
+
+function getModerationKey(chatId, userId) {
+  return `${chatId}:${userId}`;
+}
+
+function getModerationState(chatId, userId) {
+  const key = getModerationKey(chatId, userId);
+  if (!moderationStates.has(key)) {
+    moderationStates.set(key, {
+      warnings: 0,
+      messages: [],
+      lastTexts: [],
+      mutedUntil: 0,
+    });
+  }
+  return moderationStates.get(key);
+}
+
+function getDisplayName(user) {
+  if (!user) return "Member";
+  return user.username ? `@${user.username}` : user.first_name || "Member";
+}
+
+async function isChatAdmin(chatId, userId) {
+  try {
+    const member = await bot.getChatMember(chatId, userId);
+    return ["creator", "administrator"].includes(member.status);
+  } catch (error) {
+    console.error("Could not check admin status:", error.message);
+    return false;
+  }
+}
+
+function detectRuleViolations(text, state) {
+  const now = Date.now();
+  const normalized = text.toLowerCase().replace(/\s+/g, " ").trim();
+  const reasons = [];
+
+  state.messages = state.messages.filter(
+    (item) => now - item.timestamp <= moderationConfig.floodWindowMs,
+  );
+  state.lastTexts = state.lastTexts.filter(
+    (item) => now - item.timestamp <= moderationConfig.repeatWindowMs,
+  );
+
+  state.messages.push({ timestamp: now });
+  state.lastTexts.push({ text: normalized, timestamp: now });
+
+  const repeatCount = state.lastTexts.filter((item) => item.text === normalized).length;
+  const hasSuspiciousLink =
+    /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|bit\.ly|tinyurl|discord\.gg)/i.test(text);
+  const upperLetters = text.replace(/[^A-Z]/g, "").length;
+  const letters = text.replace(/[^a-zA-Z]/g, "").length;
+  const capsRatio = letters > 0 ? upperLetters / letters : 0;
+  const hasBannedPhrase = moderationConfig.bannedWords.some((word) =>
+    normalized.includes(word),
+  );
+
+  if (state.messages.length > moderationConfig.maxMessagesInWindow) {
+    reasons.push("flooding the chat");
+  }
+  if (normalized.length > 5 && repeatCount >= 3) {
+    reasons.push("sending the same message repeatedly");
+  }
+  if (hasSuspiciousLink) {
+    reasons.push("posting suspicious links or invites");
+  }
+  if (letters >= 18 && capsRatio > 0.7) {
+    reasons.push("using excessive capital letters");
+  }
+  if (hasBannedPhrase) {
+    reasons.push("breaking the group rules");
+  }
+
+  return [...new Set(reasons)];
+}
+
+async function warnOrRestrictUser(msg, state, reasons) {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const name = getDisplayName(msg.from);
+  state.warnings += 1;
+
+  try {
+    await bot.deleteMessage(chatId, msg.message_id);
+  } catch (error) {
+    console.error("Could not delete violating message:", error.message);
+  }
+
+  if (state.warnings <= moderationConfig.maxWarnings) {
+    const remaining = moderationConfig.maxWarnings - state.warnings;
+    const nextAction =
+      remaining > 0
+        ? `${remaining} more warning${remaining === 1 ? "" : "s"} before a mute.`
+        : "The next violation will mute you.";
+    await bot.sendMessage(
+      chatId,
+      `${name}, warning ${state.warnings}/${moderationConfig.maxWarnings}: ${reasons.join(", ")}. ${nextAction}`,
+    );
+    return;
+  }
+
+  const until = Math.floor(Date.now() / 1000) + moderationConfig.muteMinutes * 60;
+  state.mutedUntil = until * 1000;
+
+  try {
+    await bot.restrictChatMember(
+      chatId,
+      userId,
+      {
+        can_send_messages: false,
+        can_send_media_messages: false,
+        can_send_other_messages: false,
+        can_add_web_page_previews: false,
+      },
+      { until_date: until },
+    );
+    await bot.sendMessage(
+      chatId,
+      `${name} has been muted for ${moderationConfig.muteMinutes} minutes after repeated rule violations.`,
+    );
+  } catch (error) {
+    console.error("Could not restrict member:", error.message);
+    await bot.sendMessage(
+      chatId,
+      `${name} has passed the warning limit, but I need admin permission to mute members.`,
+    );
+  }
+}
+
+async function moderateGroupMessage(msg) {
+  if (!isGroupChat(msg.chat) || !msg.from || msg.from.is_bot) return false;
+  if (typeof msg.text !== "string" || msg.text.startsWith("/")) return false;
+  if (await isChatAdmin(msg.chat.id, msg.from.id)) return false;
+
+  const state = getModerationState(msg.chat.id, msg.from.id);
+  const reasons = detectRuleViolations(msg.text, state);
+
+  if (reasons.length === 0) return false;
+
+  await warnOrRestrictUser(msg, state, reasons);
+  return true;
+}
 
 const synonyms = {
   engine: ["power", "powerplant"],
@@ -347,6 +547,8 @@ function keywordMatchScore(input, question) {
   const questionWords = new Set(tokenize(question));
   let matchCount = 0;
 
+  if (questionWords.size === 0) return 0;
+
   questionWords.forEach((word) => {
     if (inputWords.has(word)) matchCount++;
   });
@@ -422,197 +624,220 @@ function findNewWords(input, knowledgeBase, response) {
   }
 }
 
-let memory = {};
 let speech = null;
 
-function handleUserInput(text) {
-  let input = text;
-  console.log(input);
-  if (input == "") return;
-  let out = tokenize(input);
-  let botout = null;
-  if (
-    (contextWindow[0] != "" && out.includes("it")) ||
-    out.includes("that") ||
-    out.includes("this")
-  ) {
-    input = getTopic(input);
-  } else {
-    console.log("joe");
+function getChatState(chatId) {
+  if (!chatStates.has(chatId)) {
+    chatStates.set(chatId, {
+      history: [],
+      pendingLearning: null,
+      topics: [],
+      lastQuestion: null,
+      lastAnswerKey: null,
+    });
   }
+  return chatStates.get(chatId);
+}
 
-  let answer = findAnswer(input);
-  console.log(answer);
+function normalizeText(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-  if (
-    (answer.all == 1 && answer.res == "fair") ||
-    answer.res == "draw" ||
-    answer.res == "good"
-  ) {
-    console.log(answer.all);
-    updateContextMemory(input, answer.ans);
-    botout = answer.ans;
-  } else {
-    botout = "I don't know that yet. Can you teach me?";
-  }
-  findNewWords(input, knowledge, answer);
-  console.log(botout);
-  return botout;
+function rememberTurn(state, role, text) {
+  state.history.push({ role, text, timestamp: Date.now() });
+  if (state.history.length > 12) state.history.shift();
+}
+
+function learnAnswer(question, answer) {
+  const cleanQuestion = normalizeText(question);
+  const cleanAnswer = answer.trim();
+  if (!cleanQuestion || !cleanAnswer) return false;
+
+  memory[cleanQuestion] = cleanAnswer;
+  saveLearnedMemory();
+  return true;
+}
+
+function parseTeachCommand(text) {
+  const match = text.match(/^teach\s*:\s*(.+?)\s*(?:=>|=|-{2,}|:)\s*(.+)$/i);
+  if (!match) return null;
+  return { question: match[1].trim(), answer: match[2].trim() };
+}
+
+function extractTopics(input) {
+  const normalized = normalizeText(input);
+  const tokens = new Set(tokenize(normalized));
+  const topics = [];
+
+  topicExtract.forEach((topic) => {
+    const topicTokens = tokenize(topic);
+    if (
+      normalized.includes(topic) ||
+      topicTokens.some((token) => tokens.has(token))
+    ) {
+      topics.push(topic);
+    }
+  });
+
+  Object.keys(embeddings).forEach((topic) => {
+    if (tokens.has(topic) && !topics.includes(topic)) topics.push(topic);
+  });
+
+  return topics.slice(0, 5);
+}
+
+function updateChatTopics(state, input) {
+  const topics = extractTopics(input);
+  if (topics.length === 0) return;
+
+  state.topics = [
+    ...topics,
+    ...state.topics.filter((topic) => !topics.includes(topic)),
+  ].slice(0, 8);
+}
+
+function resolveContextReferences(input, state) {
+  if (state.topics.length === 0) return input;
+  const topic = state.topics[0];
+  return input.replace(/\b(it|that|this|they|them)\b/gi, topic);
 }
 
 function detectEmotion(text) {
-  const positive = ["great", "awesome", "thank", "perfect"];
-  const negative = ["bad", "sad", "frustrated", "angry", "problem"];
-  const tokens = this.tokenize(text);
-  console.log(tokens);
-  if (tokens.some((t) => negative.includes(t))) return "Sorry to here that.";
-  if (tokens.some((t) => positive.includes(t))) return "Im glad to help.";
+  const positive = ["great", "awesome", "thank", "perfect", "good", "nice"];
+  const negative = [
+    "bad",
+    "sad",
+    "frustrated",
+    "angry",
+    "problem",
+    "broken",
+    "fail",
+  ];
+  const tokens = tokenize(text);
+
+  if (tokens.some((token) => negative.includes(token))) {
+    return "Sorry about that. ";
+  }
+  if (tokens.some((token) => positive.includes(token))) {
+    return "Glad to help. ";
+  }
   return "";
 }
 
-function findAnswer(input) {
-  let bestMatch = null;
-  let bestScore = 0;
-  let matchKey = null;
-  let matchscore = 0;
+function topicAttentionScore(question, state) {
+  if (!state || state.topics.length === 0) return 0;
+  const questionTokens = new Set(tokenize(question));
 
-  // Match from memory
-  for (let q in memory) {
-    const score = similarityScore(input, q);
-    if (score > bestScore) {
-      bestScore = score;
-      bestMatch = memory[q];
-    }
+  return state.topics.reduce((score, topic, index) => {
+    const weight = Math.max(0.1, 1 - index * 0.15);
+    const topicTokens = tokenize(topic);
+    return topicTokens.some((token) => questionTokens.has(token)) ? score + weight : score;
+  }, 0);
+}
+
+function answerCandidateScore(input, question, state) {
+  const inputTokens = tokenize(input);
+  const questionTokens = tokenize(question);
+  const flowScore =
+    checkScore(checkWordFlow(input, questionTokens)) /
+    Math.max(inputTokens.length - 1, 1);
+  const exactBoost = normalizeText(input) === normalizeText(question) ? 1 : 0;
+  const memoryBoost = state.lastAnswerKey === question ? 0.25 : 0;
+
+  return (
+    exactBoost * 0.35 +
+    similarityScore(input, question) * 0.25 +
+    keywordMatchScore(input, question) * 0.2 +
+    smartEmbeddingAttention(input, question) * 0.25 +
+    flowScore * 0.15 +
+    topicAttentionScore(question, state) * 0.1 +
+    memoryBoost
+  );
+}
+
+function findAnswer(input, state) {
+  const knowledgeBase = { ...knowledge, ...memory };
+  const candidates = Object.entries(knowledgeBase)
+    .map(([question, answer]) => ({
+      question,
+      answer,
+      score: answerCandidateScore(input, question, state),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const best = candidates[0];
+  if (best && best.score >= 0.32) {
+    return {
+      ans: best.answer,
+      key: best.question,
+      confidence: best.score,
+      all: 1,
+      res: best.score >= 0.55 ? "good" : "fair",
+    };
   }
 
-  const context = getAttentionScore(knowledge, input);
-  let me = null;
-  // Match from knowledge
-  for (let q in knowledge) {
-    const score = similarityScore(input, q);
-    if (score > bestScore) {
-      bestScore = score;
-      me = q;
-      bestMatch = knowledge[q];
-      matchKey = q;
-    }
+  const reasoning = reason(input, memory);
+  if (reasoning) {
+    return {
+      ans: reasoning,
+      key: input,
+      confidence: 0.4,
+      all: 1,
+      res: "reasoned",
+    };
   }
 
-  let flow = checkFlowOfAll(knowledge, input);
+  return {
+    ans: null,
+    key: null,
+    confidence: best ? best.score : 0,
+    all: 0,
+    res: "unknown",
+  };
+}
 
-  let embading = getContextRanking(input, knowledge);
+function handleUserInput(chatId, text) {
+  const state = getChatState(chatId);
+  const rawInput = text.trim();
+  if (!rawInput) return "";
 
-  if (matchKey) {
-    let joe = matchKey.split(/\W+/);
-    let flowscore = checkWordFlow(input, joe);
-    flowscore.forEach((num, index) => {
-      if (num == flowscore[index + 1] - 1) {
-        matchscore++;
-      }
-    });
+  rememberTurn(state, "user", rawInput);
+
+  const taught = parseTeachCommand(rawInput);
+  if (taught) {
+    learnAnswer(taught.question, taught.answer);
+    state.pendingLearning = null;
+    updateChatTopics(state, taught.question);
+    return "Got it. I learned that and will use it next time.";
   }
 
-  // Use reasoning if no good match
-  if (bestScore < 0.4 && context[0].score < 1 && matchscore < 2) {
-    const reasoning = reason(input, memory);
-    if (reasoning) return reasoning;
-  }
-  let overral = null;
-  let probable = null;
-
-  if (
-    bestMatch == context[0].item[1] &&
-    bestMatch == flow[0].item[1] &&
-    embading[0].answer == bestMatch
-  ) {
-    overral = "draw";
-    console.log(
-      bestScore +
-        "\n" +
-        context[0].score +
-        "\n " +
-        flow[0].checkscore +
-        "\n " +
-        embading[0].score,
-    );
-    probable = bestMatch;
-  } else if (
-    bestMatch == context[0].item[1] &&
-    bestMatch != flow[0].item[1] &&
-    bestMatch == embading[0].answer
-  ) {
-    overral = "good";
-    probable = bestMatch;
-  } else if (
-    bestMatch == context[0].item[1] &&
-    bestMatch == flow[0].item[1] &&
-    bestMatch != embading[0].answer
-  ) {
-    overral = "good";
-    probable = bestMatch;
-  } else if (
-    bestMatch == flow[0].item[1] &&
-    bestMatch != context[0].item[0] &&
-    bestMatch == embading[0].answer
-  ) {
-    overral = "fair";
-    probable = bestMatch;
-  } else if (
-    flow[0].item[1] == context[0].item[1] &&
-    flow[0].item[1] != bestMatch &&
-    bestMatch != embading[0].answer
-  ) {
-    overral = "fair";
-    probable = context[0].item[1];
-  } else if (
-    bestMatch != flow[0].item[1] &&
-    context[0].item[1] != flow[0].item[1] &&
-    context[0].item[1] != bestMatch &&
-    bestMatch != embading[0].answer
-  ) {
-    overral = "fair";
-    probable = embading[0].answer;
-  } else if (
-    bestMatch != context[0].item[1] &&
-    bestMatch != embading[0].answer &&
-    flow[0].item[1] != bestMatch
-  ) {
-    overral = "fair";
-    probable = embading[0].answer;
-  } else if (
-    bestMatch == context[0].item[1] &&
-    bestMatch != embading[0].answer &&
-    flow[0].item[1] != bestMatch
-  ) {
-    overral = "fair";
-    alert("fair4");
-    probable = embading[0].answer;
-  } else if (
-    bestMatch != context[0].item[1] &&
-    bestMatch == embading[0].answer &&
-    flow[0].item[1] != bestMatch
-  ) {
-    overral = "fair";
-    probable = embading[0].answer;
-  } else {
-    overral = "fair";
-    alert("add");
-    console.log(bestMatch);
-    console.log(context[0]);
-    probable = embading[0].answer;
+  if (state.pendingLearning) {
+    const learned = learnAnswer(state.pendingLearning, rawInput);
+    const reply = learned
+      ? "Thanks. I learned that answer and saved it."
+      : "I could not save that yet. Try: teach: question = answer";
+    state.pendingLearning = null;
+    return reply;
   }
 
-  let overralScore = 1;
-  if (
-    bestScore < 0.4 &&
-    flow[0].checkscore < 1 &&
-    context[0].score < 1 &&
-    embading[0].score < 0.2
-  ) {
-    overralScore = 0;
+  const input = resolveContextReferences(rawInput, state);
+  updateChatTopics(state, input);
+
+  const answer = findAnswer(input, state);
+  if (answer.all === 1 && answer.ans) {
+    updateContextMemory(input, answer.key);
+    state.lastQuestion = input;
+    state.lastAnswerKey = answer.key;
+    rememberTurn(state, "bot", answer.ans);
+    return `${detectEmotion(rawInput)}${answer.ans}`;
   }
 
-  return { ans: probable, res: overral, all: overralScore };
+  state.pendingLearning = input;
+  return "I don't know that yet. Teach me by replying with the answer, or use: teach: question = answer";
 }
 
 function reason(question, memory) {
@@ -686,8 +911,9 @@ function dropout(input, rate = 0.1) {
 let userFeedback = [];
 
 function getUserFeedback(response) {
-  // Get feedback from the user: Positive or Negative
-  return prompt(`Is this response helpful? (yes/no): ${response}`);
+  // Telegram learning is handled in handleUserInput; Node has no prompt().
+  console.log("Feedback requested for:", response);
+  return null;
 }
 
 function adjustModelBasedOnFeedback(feedback) {
