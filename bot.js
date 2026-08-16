@@ -855,6 +855,7 @@ async function searchWebInstantAnswer(input) {
   });
 
   const data = response.data;
+  console.log("DuckDuckGo response:", data);
   const answer = data.AbstractText || data.Answer;
   if (!answer) return null;
 
