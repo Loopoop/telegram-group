@@ -21,6 +21,10 @@ bot.onText(/\/rules/, (msg) => {
   bot.sendMessage(msg.chat.id, formatGroupRules());
 });
 
+bot.on("callback_query", async (query) => {
+  await handleAnswerChoice(query);
+});
+
 // Respond to any text message
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -637,6 +641,7 @@ function getChatState(chatId) {
     chatStates.set(chatId, {
       history: [],
       pendingLearning: null,
+      pendingChoice: null,
       topics: [],
       lastQuestion: null,
       lastAnswerKey: null,
@@ -869,6 +874,102 @@ function formatOnlineAnswer(result) {
   return `I found this online from ${result.source}:\n${result.answer}\nSource: ${result.url}`;
 }
 
+async function sendAnswerChoice(chatId, state, input, localAnswer) {
+  state.pendingChoice = {
+    input,
+    localAnswer,
+    createdAt: Date.now(),
+  };
+
+  await bot.sendMessage(
+    chatId,
+    "I am not fully sure about this. What should I do?",
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "Search online", callback_data: "answer:search" },
+            { text: "Teach it", callback_data: "answer:teach" },
+          ],
+        ],
+      },
+    },
+  );
+}
+
+async function clearChoiceButtons(query) {
+  const message = query.message;
+  if (!message) return;
+
+  try {
+    await bot.editMessageReplyMarkup(
+      { inline_keyboard: [] },
+      {
+        chat_id: message.chat.id,
+        message_id: message.message_id,
+      },
+    );
+  } catch (error) {
+    console.error("Could not clear choice buttons:", error.message);
+  }
+}
+
+async function handleAnswerChoice(query) {
+  const chatId = query.message?.chat?.id;
+  const action = query.data;
+
+  if (!chatId || !action?.startsWith("answer:")) return;
+
+  const state = getChatState(chatId);
+  const choice = state.pendingChoice;
+
+  try {
+    await bot.answerCallbackQuery(query.id);
+  } catch (error) {
+    console.error("Could not answer callback:", error.message);
+  }
+
+  if (!choice) {
+    await bot.sendMessage(chatId, "That question is no longer active. Please ask it again.");
+    return;
+  }
+
+  await clearChoiceButtons(query);
+
+  if (action === "answer:teach") {
+    state.pendingLearning = choice.input;
+    state.pendingChoice = null;
+    await bot.sendMessage(chatId, "Okay. Reply with the answer and I will learn it.");
+    return;
+  }
+
+  if (action === "answer:search") {
+    await bot.sendMessage(chatId, "Searching online...");
+    const onlineAnswer = await searchOnline(choice.input);
+    state.pendingChoice = null;
+
+    if (onlineAnswer) {
+      const reply = formatOnlineAnswer(onlineAnswer);
+      rememberTurn(state, "bot", reply);
+      await bot.sendMessage(chatId, reply);
+      return;
+    }
+
+    if (choice.localAnswer?.ans) {
+      const fallback = `I could not find a strong online result. My best local answer is: ${choice.localAnswer.ans}`;
+      rememberTurn(state, "bot", fallback);
+      await bot.sendMessage(chatId, fallback);
+      return;
+    }
+
+    state.pendingLearning = choice.input;
+    await bot.sendMessage(
+      chatId,
+      "I could not find a good online result. Reply with the answer and I will learn it.",
+    );
+  }
+}
+
 function findAnswer(input, state) {
   const knowledgeBase = { ...knowledge, ...memory };
   const candidates = Object.entries(knowledgeBase)
@@ -921,6 +1022,7 @@ async function handleUserInput(chatId, text) {
   if (taught) {
     learnAnswer(taught.question, taught.answer);
     state.pendingLearning = null;
+    state.pendingChoice = null;
     updateChatTopics(state, taught.question);
     return "Got it. I learned that and will use it next time.";
   }
@@ -931,8 +1033,11 @@ async function handleUserInput(chatId, text) {
       ? "Thanks. I learned that answer and saved it."
       : "I could not save that yet. Try: teach: question = answer";
     state.pendingLearning = null;
+    state.pendingChoice = null;
     return reply;
   }
+
+  state.pendingChoice = null;
 
   const input = resolveContextReferences(rawInput, state);
   updateChatTopics(state, input);
@@ -950,28 +1055,8 @@ async function handleUserInput(chatId, text) {
     return `${detectEmotion(rawInput)}${answer.ans}`;
   }
 
-  try {
-    await bot.sendMessage(chatId, "I am not fully sure, so I am checking online...");
-    const onlineAnswer = await searchOnline(input);
-    if (onlineAnswer) {
-      const reply = formatOnlineAnswer(onlineAnswer);
-      rememberTurn(state, "bot", reply);
-      return reply;
-    }
-  } catch (error) {
-    console.error("Online answer failed:", error.message);
-  }
-
-  if (answer.all === 1 && answer.ans) {
-    updateContextMemory(input, answer.key);
-    state.lastQuestion = input;
-    state.lastAnswerKey = answer.key;
-    rememberTurn(state, "bot", answer.ans);
-    return `I am not fully sure, but my best local answer is: ${answer.ans}`;
-  }
-
-  state.pendingLearning = input;
-  return "I don't know that yet. Teach me by replying with the answer, or use: teach: question = answer";
+  await sendAnswerChoice(chatId, state, input, answer);
+  return "";
 }
 
 function reason(question, memory) {
