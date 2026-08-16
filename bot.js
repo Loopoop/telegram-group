@@ -9,8 +9,10 @@ if (!token) {
   throw new Error("Missing TELEGRAM_TOKEN in .env");
 }
 
-// Create a bot that uses polling to fetch new messages
-const bot = new TelegramBot(token, { polling: true });
+// Create a bot that uses polling to fetch new messages.
+// autoStart lets us patch a deprecated library alias before polling begins.
+const bot = new TelegramBot(token, { polling: { autoStart: false } });
+bot.deleteWebHook = bot.deleteWebhook.bind(bot);
 
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
@@ -144,9 +146,13 @@ function detectRuleViolations(text, state) {
   state.messages.push({ timestamp: now });
   state.lastTexts.push({ text: normalized, timestamp: now });
 
-  const repeatCount = state.lastTexts.filter((item) => item.text === normalized).length;
+  const repeatCount = state.lastTexts.filter(
+    (item) => item.text === normalized,
+  ).length;
   const hasSuspiciousLink =
-    /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|bit\.ly|tinyurl|discord\.gg)/i.test(text);
+    /(https?:\/\/|www\.|t\.me\/|telegram\.me\/|bit\.ly|tinyurl|discord\.gg)/i.test(
+      text,
+    );
   const upperLetters = text.replace(/[^A-Z]/g, "").length;
   const letters = text.replace(/[^a-zA-Z]/g, "").length;
   const capsRatio = letters > 0 ? upperLetters / letters : 0;
@@ -198,7 +204,8 @@ async function warnOrRestrictUser(msg, state, reasons) {
     return;
   }
 
-  const until = Math.floor(Date.now() / 1000) + moderationConfig.muteMinutes * 60;
+  const until =
+    Math.floor(Date.now() / 1000) + moderationConfig.muteMinutes * 60;
   state.mutedUntil = until * 1000;
 
   try {
@@ -746,7 +753,9 @@ function topicAttentionScore(question, state) {
   return state.topics.reduce((score, topic, index) => {
     const weight = Math.max(0.1, 1 - index * 0.15);
     const topicTokens = tokenize(topic);
-    return topicTokens.some((token) => questionTokens.has(token)) ? score + weight : score;
+    return topicTokens.some((token) => questionTokens.has(token))
+      ? score + weight
+      : score;
   }, 0);
 }
 
@@ -773,7 +782,10 @@ function answerCandidateScore(input, question, state) {
 function cleanSearchQuery(input) {
   return input
     .replace(/\b(who|what|when|where|why|how)\b/gi, " ")
-    .replace(/\b(is|are|was|were|does|do|did|can|could|please|tell me about)\b/gi, " ")
+    .replace(
+      /\b(is|are|was|were|does|do|did|can|could|please|tell me about)\b/gi,
+      " ",
+    )
     .replace(/[?!.]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -825,7 +837,9 @@ async function searchWikipedia(input) {
     source: "Wikipedia",
     title: summary.title || first.title,
     answer: compactSummary(summary.extract),
-    url: summary.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(first.title)}`,
+    url:
+      summary.content_urls?.desktop?.page ||
+      `https://en.wikipedia.org/wiki/${encodeURIComponent(first.title)}`,
   };
 }
 
@@ -930,7 +944,10 @@ async function handleAnswerChoice(query) {
   }
 
   if (!choice) {
-    await bot.sendMessage(chatId, "That question is no longer active. Please ask it again.");
+    await bot.sendMessage(
+      chatId,
+      "That question is no longer active. Please ask it again.",
+    );
     return;
   }
 
@@ -939,7 +956,10 @@ async function handleAnswerChoice(query) {
   if (action === "answer:teach") {
     state.pendingLearning = choice.input;
     state.pendingChoice = null;
-    await bot.sendMessage(chatId, "Okay. Reply with the answer and I will learn it.");
+    await bot.sendMessage(
+      chatId,
+      "Okay. Reply with the answer and I will learn it.",
+    );
     return;
   }
 
@@ -1175,3 +1195,7 @@ function fetchRealTimeData() {
 
 // Fetch real-time data every 10 seconds
 setInterval(fetchRealTimeData, 10000);
+
+bot.startPolling().catch((error) => {
+  console.error("Failed to start Telegram polling:", error.message);
+});
