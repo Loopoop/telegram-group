@@ -870,6 +870,7 @@ async function searchWebInstantAnswer(input) {
 async function searchOnline(input) {
   try {
     const wikipedia = await searchWikipedia(input);
+    console.log("Wikipedia search result:", wikipedia);
     if (wikipedia) return wikipedia;
   } catch (error) {
     console.log("Wikipedia search failed:", error.message);
