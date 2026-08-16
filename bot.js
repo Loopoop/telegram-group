@@ -873,7 +873,7 @@ async function searchOnline(input) {
     console.log("Wikipedia search result:", wikipedia);
     if (wikipedia) return wikipedia;
   } catch (error) {
-    console.log("Wikipedia search failed:", error.message);
+    //console.log("Wikipedia search failed:", error.message);
     console.error("Wikipedia search failed:", error.message);
   }
 
@@ -881,7 +881,6 @@ async function searchOnline(input) {
     const web = await searchWebInstantAnswer(input);
     if (web) return web;
   } catch (error) {
-    console.log("DuckDuckGo search failed:", error.message);
     console.error("Web search failed:", error.message);
   }
 
