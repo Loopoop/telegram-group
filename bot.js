@@ -1,6 +1,7 @@
 const TelegramBot = require("node-telegram-bot-api").default;
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios");
 require("dotenv").config();
 // Replace with your real bot token from BotFather
 const token = process.env.TELEGRAM_TOKEN;
@@ -28,7 +29,7 @@ bot.on("message", async (msg) => {
   if (await moderateGroupMessage(msg)) return;
 
   if (typeof text === "string" && !text.startsWith("/")) {
-    const handle = handleUserInput(chatId, text);
+    const handle = await handleUserInput(chatId, text);
     if (handle) {
       bot.sendMessage(chatId, handle);
     }
@@ -77,6 +78,11 @@ const moderationConfig = {
     "join my channel",
     "crypto pump",
   ],
+};
+
+const onlineSearchConfig = {
+  timeoutMs: 6000,
+  localConfidenceThreshold: 0.45,
 };
 
 function formatGroupRules() {
@@ -759,6 +765,110 @@ function answerCandidateScore(input, question, state) {
   );
 }
 
+function cleanSearchQuery(input) {
+  return input
+    .replace(/\b(who|what|when|where|why|how)\b/gi, " ")
+    .replace(/\b(is|are|was|were|does|do|did|can|could|please|tell me about)\b/gi, " ")
+    .replace(/[?!.]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function compactSummary(text, maxLength = 650) {
+  if (!text) return "";
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean.length <= maxLength) return clean;
+
+  const clipped = clean.slice(0, maxLength);
+  const sentenceEnd = Math.max(
+    clipped.lastIndexOf("."),
+    clipped.lastIndexOf("!"),
+    clipped.lastIndexOf("?"),
+  );
+
+  return `${clipped.slice(0, sentenceEnd > 160 ? sentenceEnd + 1 : maxLength).trim()}...`;
+}
+
+async function searchWikipedia(input) {
+  const query = cleanSearchQuery(input) || input;
+  const searchUrl = "https://en.wikipedia.org/w/api.php";
+
+  const searchResponse = await axios.get(searchUrl, {
+    timeout: onlineSearchConfig.timeoutMs,
+    params: {
+      action: "query",
+      list: "search",
+      srsearch: query,
+      format: "json",
+      origin: "*",
+      srlimit: 1,
+    },
+  });
+
+  const first = searchResponse.data?.query?.search?.[0];
+  if (!first?.title) return null;
+
+  const summaryResponse = await axios.get(
+    `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(first.title)}`,
+    { timeout: onlineSearchConfig.timeoutMs },
+  );
+
+  const summary = summaryResponse.data;
+  if (!summary?.extract) return null;
+
+  return {
+    source: "Wikipedia",
+    title: summary.title || first.title,
+    answer: compactSummary(summary.extract),
+    url: summary.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(first.title)}`,
+  };
+}
+
+async function searchWebInstantAnswer(input) {
+  const response = await axios.get("https://api.duckduckgo.com/", {
+    timeout: onlineSearchConfig.timeoutMs,
+    params: {
+      q: input,
+      format: "json",
+      no_html: 1,
+      skip_disambig: 1,
+    },
+  });
+
+  const data = response.data;
+  const answer = data.AbstractText || data.Answer;
+  if (!answer) return null;
+
+  return {
+    source: data.AbstractSource || "DuckDuckGo",
+    title: data.Heading || "Web result",
+    answer: compactSummary(answer),
+    url: data.AbstractURL || data.AnswerURL || "https://duckduckgo.com/",
+  };
+}
+
+async function searchOnline(input) {
+  try {
+    const wikipedia = await searchWikipedia(input);
+    if (wikipedia) return wikipedia;
+  } catch (error) {
+    console.error("Wikipedia search failed:", error.message);
+  }
+
+  try {
+    const web = await searchWebInstantAnswer(input);
+    if (web) return web;
+  } catch (error) {
+    console.error("Web search failed:", error.message);
+  }
+
+  return null;
+}
+
+function formatOnlineAnswer(result) {
+  return `I found this online from ${result.source}:\n${result.answer}\nSource: ${result.url}`;
+}
+
 function findAnswer(input, state) {
   const knowledgeBase = { ...knowledge, ...memory };
   const candidates = Object.entries(knowledgeBase)
@@ -800,7 +910,7 @@ function findAnswer(input, state) {
   };
 }
 
-function handleUserInput(chatId, text) {
+async function handleUserInput(chatId, text) {
   const state = getChatState(chatId);
   const rawInput = text.trim();
   if (!rawInput) return "";
@@ -828,12 +938,36 @@ function handleUserInput(chatId, text) {
   updateChatTopics(state, input);
 
   const answer = findAnswer(input, state);
-  if (answer.all === 1 && answer.ans) {
+  if (
+    answer.all === 1 &&
+    answer.ans &&
+    answer.confidence >= onlineSearchConfig.localConfidenceThreshold
+  ) {
     updateContextMemory(input, answer.key);
     state.lastQuestion = input;
     state.lastAnswerKey = answer.key;
     rememberTurn(state, "bot", answer.ans);
     return `${detectEmotion(rawInput)}${answer.ans}`;
+  }
+
+  try {
+    await bot.sendMessage(chatId, "I am not fully sure, so I am checking online...");
+    const onlineAnswer = await searchOnline(input);
+    if (onlineAnswer) {
+      const reply = formatOnlineAnswer(onlineAnswer);
+      rememberTurn(state, "bot", reply);
+      return reply;
+    }
+  } catch (error) {
+    console.error("Online answer failed:", error.message);
+  }
+
+  if (answer.all === 1 && answer.ans) {
+    updateContextMemory(input, answer.key);
+    state.lastQuestion = input;
+    state.lastAnswerKey = answer.key;
+    rememberTurn(state, "bot", answer.ans);
+    return `I am not fully sure, but my best local answer is: ${answer.ans}`;
   }
 
   state.pendingLearning = input;
